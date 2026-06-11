@@ -10,8 +10,9 @@ variables:
   # than committing it here in plain text.
   LT_AUTH: 'cHJpeWFuc2h1ZzpMVF9JNXphSnB2S2I5dG1wWGtpNWh0cDQ5SGVWejg1NWoxQ2pXSFA3YzB0RnR6NVlhag=='
   INITIAL_TEST_RUN_ID: '01KTQF13VGZCTNCMBWVTANYWBJ'   # test run id used to trigger the run
-  POLL_INTERVAL_SECONDS: 10      # how often to check status
-  MAX_POLL_ATTEMPTS: 180         # safety cap (180 * 10s = 30 min)
+  POLL_INTERVAL_SECONDS: 10        # how often to check status
+  MAX_POLL_ATTEMPTS: 180           # safety cap (180 * 10s = 30 min)
+  POST_COMPLETE_DELAY_SECONDS: 300 # wait after status leaves "In Progress" before fetching results
   RESPONSE_FILE: '$(System.DefaultWorkingDirectory)/lt-response.json'
   RESULTS_XML: '$(System.DefaultWorkingDirectory)/lambdatest-results.xml'
 
@@ -85,6 +86,19 @@ stages:
                 echo "##vso[task.logissue type=error]Timed out waiting for the run to complete."
                 exit 1
               fi
+
+              # Status has left "In Progress" — wait before fetching final results,
+              # to let the run fully settle.
+              echo "Status changed to '${STATUS}'. Waiting $(POST_COMPLETE_DELAY_SECONDS)s before fetching results..."
+              sleep $(POST_COMPLETE_DELAY_SECONDS)
+
+              # Re-fetch so the saved payload reflects the settled results
+              echo "Fetching final results..."
+              FINAL_RESPONSE=$(curl -sS --request GET \
+                --url "https://test-manager-api.lambdatest.com/api/v1/test-run/instances/${TEST_RUN_ID}" \
+                --header "Authorization: Basic $(LT_AUTH)")
+
+              STATUS=$(echo "$FINAL_RESPONSE" | jq -r '.test_run_details.status')
 
               # Save the final payload so later steps can convert it
               echo "$FINAL_RESPONSE" > "$(RESPONSE_FILE)"
