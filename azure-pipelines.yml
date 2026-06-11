@@ -9,7 +9,7 @@ variables:
   # defining it as a SECRET variable in the pipeline UI or a variable group rather
   # than committing it here in plain text.
   LT_AUTH: 'cHJpeWFuc2h1ZzpMVF9JNXphSnB2S2I5dG1wWGtpNWh0cDQ5SGVWejg1NWoxQ2pXSFA3YzB0RnR6NVlhag=='
-  INITIAL_TEST_RUN_ID: '01KTTRWWQDQ2S15PTFWQ0VDT0T'   # test run id used to trigger the run
+  INITIAL_TEST_RUN_ID: '01KTQF13VGZCTNCMBWVTANYWBJ'   # test run id used to trigger the run
   POLL_INTERVAL_SECONDS: 10      # how often to check status
   MAX_POLL_ATTEMPTS: 180         # safety cap (180 * 10s = 30 min)
   RESPONSE_FILE: '$(System.DefaultWorkingDirectory)/lt-response.json'
