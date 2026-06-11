@@ -1,20 +1,156 @@
 trigger:
-- main
+  - main
 
 pool:
   vmImage: 'ubuntu-latest'
 
+variables:
+  # NOTE: LT_AUTH holds the base64 of "username:accesskey". For security, prefer
+  # defining it as a SECRET variable in the pipeline UI or a variable group rather
+  # than committing it here in plain text.
+  LT_AUTH: 'cHJpeWFuc2h1ZzpMVF9JNXphSnB2S2I5dG1wWGtpNWh0cDQ5SGVWejg1NWoxQ2pXSFA3YzB0RnR6NVlhag=='
+  INITIAL_TEST_RUN_ID: '01KTTRWWQDQ2S15PTFWQ0VDT0T'   # test run id used to trigger the run
+  POLL_INTERVAL_SECONDS: 10      # how often to check status
+  MAX_POLL_ATTEMPTS: 180         # safety cap (180 * 10s = 30 min)
+  RESPONSE_FILE: '$(System.DefaultWorkingDirectory)/lt-response.json'
+  RESULTS_XML: '$(System.DefaultWorkingDirectory)/lambdatest-results.xml'
+
 stages:
-- stage: TriggerLambdaTest
-  displayName: "Trigger LambdaTest HyperExecute Job"
-  jobs:
-  - job: RunLambdaTestCurl
-    displayName: "Execute LambdaTest HyperExecute API"
-    steps:
-      - script: |
-          echo "Triggering LambdaTest HyperExecute Test Run..."
-          curl -X POST "https://test-manager-api.lambdatest.com/api/atm/v1/hyperexecute" \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Basic cHJpeWFuc2h1ZzpMVF9JNXphSnB2S2I5dG1wWGtpNWh0cDQ5SGVWejg1NWoxQ2pXSFA3YzB0RnR6NVlhag==" \
-          -d '{"test_run_id":"01KTV7VQPRAFPY99KDYYZT1294","concurrency":1}'
-        displayName: "Run LambdaTest HyperExecute via cURL"
+  - stage: LambdaTestRun
+    displayName: "LambdaTest HyperExecute Run"
+    jobs:
+      - job: RunAndReport
+        displayName: "Trigger, Poll, Publish"
+        steps:
+
+          # -----------------------------------------------------------------
+          # STEP 1 - Trigger the Test Run and capture the test_run_id
+          # -----------------------------------------------------------------
+          - script: |
+              set -euo pipefail
+              echo "Triggering LambdaTest HyperExecute Test Run..."
+
+              RESPONSE=$(curl -sS -X POST "https://test-manager-api.lambdatest.com/api/atm/v1/hyperexecute" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Basic $(LT_AUTH)" \
+                -d '{"test_run_id":"01KTV7VQPRAFPY99KDYYZT1294","concurrency":1}')
+
+              echo "Raw trigger response:"
+              echo "$RESPONSE"
+
+              TEST_RUN_ID=$(echo "$RESPONSE" | jq -r '.test_run_id')
+
+              if [ -z "$TEST_RUN_ID" ] || [ "$TEST_RUN_ID" = "null" ]; then
+                echo "##vso[task.logissue type=error]Failed to extract test_run_id from trigger response."
+                exit 1
+              fi
+
+              echo "Triggered test_run_id: $TEST_RUN_ID"
+              echo "##vso[task.setvariable variable=TEST_RUN_ID;isOutput=true]$TEST_RUN_ID"
+            name: trigger
+            displayName: "Step 1 - Trigger Test Run"
+
+          # -----------------------------------------------------------------
+          # STEP 2 - Poll status every 10s and save the final response to disk
+          # -----------------------------------------------------------------
+          - script: |
+              set -euo pipefail
+
+              TEST_RUN_ID="$(trigger.TEST_RUN_ID)"
+              echo "Polling status for test_run_id: $TEST_RUN_ID"
+
+              STATUS="In Progress"
+              ATTEMPT=0
+              FINAL_RESPONSE=""
+
+              while [ "$ATTEMPT" -lt "$(MAX_POLL_ATTEMPTS)" ]; do
+                ATTEMPT=$((ATTEMPT + 1))
+
+                FINAL_RESPONSE=$(curl -sS --request GET \
+                  --url "https://test-manager-api.lambdatest.com/api/v1/test-run/instances/${TEST_RUN_ID}" \
+                  --header "Authorization: Basic $(LT_AUTH)")
+
+                STATUS=$(echo "$FINAL_RESPONSE" | jq -r '.test_run_details.status')
+                echo "[Attempt ${ATTEMPT}] Current status: ${STATUS}"
+
+                if [ "$STATUS" != "In Progress" ] && [ "$STATUS" != "null" ] && [ -n "$STATUS" ]; then
+                  echo "Run finished with status: ${STATUS}"
+                  break
+                fi
+
+                sleep $(POLL_INTERVAL_SECONDS)
+              done
+
+              if [ "$STATUS" = "In Progress" ]; then
+                echo "##vso[task.logissue type=error]Timed out waiting for the run to complete."
+                exit 1
+              fi
+
+              # Save the final payload so later steps can convert it
+              echo "$FINAL_RESPONSE" > "$(RESPONSE_FILE)"
+
+              echo "=================================================="
+              echo " FINAL RESULT (status: ${STATUS})"
+              echo "=================================================="
+              echo "$FINAL_RESPONSE" | jq '.test_run_details.run_result'
+            displayName: "Step 2 - Poll Status"
+
+          # -----------------------------------------------------------------
+          # STEP 3 - Convert the LambdaTest JSON into JUnit XML
+          # -----------------------------------------------------------------
+          - script: |
+              set -euo pipefail
+              python3 - "$(RESPONSE_FILE)" "$(RESULTS_XML)" <<'PY'
+              import json, sys
+              from xml.sax.saxutils import escape, quoteattr
+
+              src, dst = sys.argv[1], sys.argv[2]
+              with open(src) as f:
+                  data = json.load(f)
+
+              instances = data.get("test_run_instances", {}).get("data", [])
+              SKIP_STATES = ("Skipped", "Blocked", "Not Started", "Cannot Automate")
+
+              total    = len(instances)
+              failures = sum(1 for i in instances if i.get("status") == "Failed")
+              skipped  = sum(1 for i in instances if i.get("status") in SKIP_STATES)
+
+              out = []
+              out.append('<?xml version="1.0" encoding="UTF-8"?>')
+              out.append(f'<testsuites tests="{total}" failures="{failures}" skipped="{skipped}">')
+              out.append(f'  <testsuite name="LambdaTest HyperExecute" tests="{total}" '
+                         f'failures="{failures}" skipped="{skipped}">')
+
+              for i in instances:
+                  name   = i.get("title", "Unnamed Test")
+                  status = i.get("status", "")
+                  url    = i.get("linked_test_url", "")
+                  out.append(f'    <testcase name={quoteattr(name)} classname="LambdaTest">')
+                  if status == "Failed":
+                      out.append(f'      <failure message="Test failed">'
+                                 f'See LambdaTest report: {escape(url)}</failure>')
+                  elif status in SKIP_STATES:
+                      out.append(f'      <skipped message={quoteattr(status)}/>')
+                  out.append('    </testcase>')
+
+              out.append('  </testsuite>')
+              out.append('</testsuites>')
+
+              with open(dst, "w") as f:
+                  f.write("\n".join(out))
+
+              print(f"Wrote {dst}: {total} tests, {failures} failed, {skipped} skipped")
+              PY
+            displayName: "Step 3 - Convert to JUnit XML"
+
+          # -----------------------------------------------------------------
+          # STEP 4 - Publish results so they show in the Tests tab / dashboard
+          # -----------------------------------------------------------------
+          - task: PublishTestResults@2
+            displayName: "Step 4 - Publish Test Results"
+            condition: always()       # publish even if a test failed
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(RESULTS_XML)'
+              testRunTitle: 'LambdaTest HyperExecute Results'
+              failTaskOnFailedTests: true    # marks the build red if a test failed
