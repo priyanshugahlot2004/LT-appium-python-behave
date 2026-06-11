@@ -33,7 +33,7 @@ stages:
               RESPONSE=$(curl -sS -X POST "https://test-manager-api.lambdatest.com/api/atm/v1/hyperexecute" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Basic $(LT_AUTH)" \
-                -d '{"test_run_id":"01KTV7VQPRAFPY99KDYYZT1294","concurrency":1}')
+                -d '{"test_run_id":"$(INITIAL_TEST_RUN_ID)","concurrency":1}')
 
               echo "Raw trigger response:"
               echo "$RESPONSE"
